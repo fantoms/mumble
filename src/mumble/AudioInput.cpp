@@ -1,32 +1,7 @@
-/* Copyright (C) 2005-2011, Thorvald Natvig <thorvald@natvig.com>
-
-   All rights reserved.
-
-   Redistribution and use in source and binary forms, with or without
-   modification, are permitted provided that the following conditions
-   are met:
-
-   - Redistributions of source code must retain the above copyright notice,
-     this list of conditions and the following disclaimer.
-   - Redistributions in binary form must reproduce the above copyright notice,
-     this list of conditions and the following disclaimer in the documentation
-     and/or other materials provided with the distribution.
-   - Neither the name of the Mumble Developers nor the names of its
-     contributors may be used to endorse or promote products derived from this
-     software without specific prior written permission.
-
-   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-   A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR
-   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+// Copyright 2005-2017 The Mumble Developers. All rights reserved.
+// Use of this source code is governed by a BSD-style license
+// that can be found in the LICENSE file at the root of the
+// Mumble source tree or at <https://www.mumble.info/LICENSE>.
 
 #include "mumble_pch.hpp"
 
@@ -110,7 +85,14 @@ AudioInput::AudioInput() : opusBuffer(g.s.iFramesPerPacket * (SAMPLE_RATE / 100)
 	iFrameSize = SAMPLE_RATE / 100;
 
 #ifdef USE_OPUS
-	opusState = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, NULL);
+	if (!g.s.bUseOpusMusicEncoding) {
+		opusState = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, NULL);
+		qWarning("AudioInput: Opus encoder set for VOIP");
+	} else {
+		opusState = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_AUDIO, NULL);
+		qWarning("AudioInput: Opus encoder set for Music");
+	}
+
 	opus_encoder_ctl(opusState, OPUS_SET_VBR(0)); // CBR
 #endif
 
@@ -143,6 +125,8 @@ AudioInput::AudioInput() : opusBuffer(g.s.iFramesPerPacket * (SAMPLE_RATE / 100)
 	iMicSampleSize = iEchoSampleSize = 0;
 
 	bPreviousVoice = false;
+
+	bResetEncoder = true;
 
 	pfMicInput = pfEchoInput = pfOutput = NULL;
 
@@ -201,10 +185,10 @@ bool AudioInput::isTransmitting() const {
 #define IN_MIXER_FLOAT(channels) \
 static void inMixerFloat##channels ( float * RESTRICT buffer, const void * RESTRICT ipt, unsigned int nsamp, unsigned int N) { \
   const float * RESTRICT input = reinterpret_cast<const float *>(ipt); \
-  register const float m = 1.0f / static_cast<float>(channels); \
+  const float m = 1.0f / static_cast<float>(channels); \
   Q_UNUSED(N); \
   for(unsigned int i=0;i<nsamp;++i) {\
-	  register float v= 0.0f; \
+	  float v= 0.0f; \
 	  for(unsigned int j=0;j<channels;++j) \
 	  	v += input[i*channels+j]; \
 	  buffer[i] = v * m; \
@@ -214,10 +198,10 @@ static void inMixerFloat##channels ( float * RESTRICT buffer, const void * RESTR
 #define IN_MIXER_SHORT(channels) \
 static void inMixerShort##channels ( float * RESTRICT buffer, const void * RESTRICT ipt, unsigned int nsamp, unsigned int N) { \
   const short * RESTRICT input = reinterpret_cast<const short *>(ipt); \
-  register const float m = 1.0f / (32768.f * static_cast<float>(channels)); \
+  const float m = 1.0f / (32768.f * static_cast<float>(channels)); \
   Q_UNUSED(N); \
   for(unsigned int i=0;i<nsamp;++i) {\
-	  register float v= 0.0f; \
+	  float v= 0.0f; \
 	  for(unsigned int j=0;j<channels;++j) \
 	  	v += static_cast<float>(input[i*channels+j]); \
 	  buffer[i] = v * m; \
@@ -594,6 +578,8 @@ void AudioInput::resetAudioProcessor() {
 		sesEcho = NULL;
 	}
 
+	bResetEncoder = true;
+
 	bResetProcessor = false;
 }
 
@@ -672,33 +658,37 @@ bool AudioInput::selectCodec() {
 	return true;
 }
 
-int AudioInput::encodeOpusFrame(short *source, int size, unsigned char *buffer) {
+int AudioInput::encodeOpusFrame(short *source, int size, EncodingOutputBuffer& buffer) {
 	int len = 0;
 #ifdef USE_OPUS
-	if (!bPreviousVoice)
+	if (bResetEncoder) {
 		opus_encoder_ctl(opusState, OPUS_RESET_STATE, NULL);
+		bResetEncoder = false;
+	}
 
 	opus_encoder_ctl(opusState, OPUS_SET_BITRATE(iAudioQuality));
 
-	len = opus_encode(opusState, source, size, buffer, 512);
+	len = opus_encode(opusState, source, size, &buffer[0], static_cast<opus_int32>(buffer.size()));
 	const int tenMsFrameCount = (size / iFrameSize);
 	iBitrate = (len * 100 * 8) / tenMsFrameCount;
 #endif
 	return len;
 }
 
-int AudioInput::encodeCELTFrame(short *psSource, unsigned char *buffer) {
+int AudioInput::encodeCELTFrame(short *psSource, EncodingOutputBuffer& buffer) {
 	int len = 0;
 	if (!cCodec)
 		return len;
 
-	if (!bPreviousVoice)
+	if (bResetEncoder) {
 		cCodec->celt_encoder_ctl(ceEncoder, CELT_RESET_STATE);
+		bResetEncoder = false;
+	}
 
 	cCodec->celt_encoder_ctl(ceEncoder, CELT_SET_PREDICTION(0));
 
 	cCodec->celt_encoder_ctl(ceEncoder, CELT_SET_VBR_RATE(iAudioQuality));
-	len = cCodec->encode(ceEncoder, psSource, buffer, qMin(iAudioQuality / (8 * 100), 127));
+	len = cCodec->encode(ceEncoder, psSource, &buffer[0], qMin<int>(iAudioQuality / (8 * 100), static_cast<int>(buffer.size())));
 	iBitrate = len * 100 * 8;
 
 	return len;
@@ -706,7 +696,6 @@ int AudioInput::encodeCELTFrame(short *psSource, unsigned char *buffer) {
 
 void AudioInput::encodeAudioFrame() {
 	int iArg;
-	ClientUser *p=ClientUser::get(g.uiSession);
 	int i;
 	float sum;
 	short max;
@@ -719,13 +708,12 @@ void AudioInput::encodeAudioFrame() {
 		return;
 
 	sum=1.0f;
-	for (i=0;i<iFrameSize;i++)
-		sum += static_cast<float>(psMic[i] * psMic[i]);
-	dPeakMic = qMax(20.0f*log10f(sqrtf(sum / static_cast<float>(iFrameSize)) / 32768.0f), -96.0f);
-
 	max = 1;
-	for (i=0;i<iFrameSize;i++)
-		max = static_cast<short>(abs(psMic[i]) > max ? abs(psMic[i]) : max);
+	for (i=0;i<iFrameSize;i++) {
+		sum += static_cast<float>(psMic[i] * psMic[i]);
+		max = std::max(static_cast<short>(abs(psMic[i])), max);
+	}
+	dPeakMic = qMax(20.0f*log10f(sqrtf(sum / static_cast<float>(iFrameSize)) / 32768.0f), -96.0f);
 	dMaxMic = max;
 
 	if (psSpeaker && (iEchoChannels > 0)) {
@@ -783,13 +771,14 @@ void AudioInput::encodeAudioFrame() {
 		iHoldFrames = 0;
 	}
 
-	if (g.s.atTransmit == Settings::Continous)
+	if (g.s.atTransmit == Settings::Continuous)
 		bIsSpeech = true;
 	else if (g.s.atTransmit == Settings::PushToTalk)
 		bIsSpeech = g.s.uiDoublePush && ((g.uiDoublePush < g.s.uiDoublePush) || (g.tDoublePush.elapsed() < g.s.uiDoublePush));
 
 	bIsSpeech = bIsSpeech || (g.iPushToTalk > 0);
 
+	ClientUser *p = ClientUser::get(g.uiSession);
 	if (g.s.bMute || ((g.s.lmLoopMode != Settings::Local) && p && (p->bMute || p->bSuppress)) || g.bPushToMute || (g.iTarget < 0)) {
 		bIsSpeech = false;
 	}
@@ -841,10 +830,16 @@ void AudioInput::encodeAudioFrame() {
 		speex_preprocess_ctl(sppPreprocess, SPEEX_PREPROCESS_SET_AGC_INCREMENT, &increment);
 	}
 
+	if (bIsSpeech && !bPreviousVoice) {
+		bResetEncoder = true;
+	}
+
 	tIdle.restart();
 
-	unsigned char buffer[512];
-	int len;
+	EncodingOutputBuffer buffer;
+	Q_ASSERT(buffer.size() >= static_cast<size_t>(iAudioQuality / 100 * iAudioFrames / 8));
+	
+	int len = 0;
 
 	bool encoded = true;
 	if (!selectCodec())
@@ -852,8 +847,11 @@ void AudioInput::encodeAudioFrame() {
 
 	if (umtType == MessageHandler::UDPVoiceCELTAlpha || umtType == MessageHandler::UDPVoiceCELTBeta) {
 		len = encodeCELTFrame(psSource, buffer);
-		if (len == 0)
+		if (len <= 0) {
+			iBitrate = 0;
+			qWarning() << "encodeCELTFrame failed" << iBufferedFrames << iFrameSize << len;
 			return;
+		}
 		++iBufferedFrames;
 	} else if (umtType == MessageHandler::UDPVoiceOpus) {
 		encoded = false;
@@ -863,24 +861,32 @@ void AudioInput::encodeAudioFrame() {
 		if (!bIsSpeech || iBufferedFrames >= iAudioFrames) {
 			if (iBufferedFrames < iAudioFrames) {
 				// Stuff frame to framesize if speech ends and we don't have enough audio
-				const size_t missingFrames = iAudioFrames - iBufferedFrames;
+				// this way we are guaranteed to have a valid framecount and won't cause
+				// a codec configuration switch by suddenly using a wildly different
+				// framecount per packet.
+				const int missingFrames = iAudioFrames - iBufferedFrames;
 				opusBuffer.insert(opusBuffer.end(), iFrameSize * missingFrames, 0);
 				iBufferedFrames += missingFrames;
+				iFrameCounter += missingFrames;
 			}
+			
+			Q_ASSERT(iBufferedFrames == iAudioFrames);
 
 			len = encodeOpusFrame(&opusBuffer[0], iBufferedFrames * iFrameSize, buffer);
 			opusBuffer.clear();
 			if (len <= 0) {
 				iBitrate = 0;
 				qWarning() << "encodeOpusFrame failed" << iBufferedFrames << iFrameSize << len;
+				iBufferedFrames = 0; // These are lost. Make sure not to mess up our sequence counter next flushCheck.
 				return;
 			}
 			encoded = true;
 		}
 	}
 
-	if (encoded)
-		flushCheck(QByteArray(reinterpret_cast<const char *>(buffer), len), ! bIsSpeech);
+	if (encoded) {
+		flushCheck(QByteArray(reinterpret_cast<char *>(&buffer[0]), len), !bIsSpeech);
+	}
 
 	if (! bIsSpeech)
 		iBitrate = 0;
@@ -908,9 +914,13 @@ void AudioInput::flushCheck(const QByteArray &frame, bool terminator) {
 	if (! terminator && iBufferedFrames < iAudioFrames)
 		return;
 
-	int flags = g.iTarget;
-	if (terminator)
+	int flags = 0;
+	if (g.iTarget > 0) {
+		flags = g.iTarget;
+	}
+	if (terminator && g.iPrevTarget > 0) {
 		flags = g.iPrevTarget;
+	}
 
 	if (g.s.lmLoopMode == Settings::Server)
 		flags = 0x1f; // Server loopback

@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
+# Copyright 2005-2017 The Mumble Developers. All rights reserved.
+# Use of this source code is governed by a BSD-style license
+# that can be found in the LICENSE file at the root of the
+# Mumble source tree or at <https://www.mumble.info/LICENSE>.
+
+#
 # Simple Mac OS X Application Bundler for Mumble
 #
 # Loosely based on original bash-version by Sebastian Schlingmann (based, again, on a OSX application bundler
@@ -81,7 +87,10 @@ def create_overlay_package():
 	if options.developer_id:
 		codesign(bundle)
 		codesign(overlaylib)
-	os.system('./macx/scripts/build-overlay-installer')
+	p = Popen(('./macx/scripts/build-overlay-installer',))
+	retval = p.wait()
+	if retval != 0:
+		raise Exception('build-overlay-installer failed')
 	if options.developer_id:
 		os.rename('release/MumbleOverlay.pkg', 'release/MumbleOverlayUnsigned.pkg')
 		prodsign('release/MumbleOverlayUnsigned.pkg', 'release/MumbleOverlay.pkg')
@@ -156,7 +165,10 @@ class AppBundle(object):
 			The compat binary displays a warning dialog telling the user that they need to download a universal version of Mumble
 		'''
 		print ' * Splicing Mumble.compat into main bundle executable'
-		os.system('lipo -create release/Mumble.compat -arch x86_64 %s -output %s' % (self.binary, self.binary))
+		p = Popen(('lipo', '-create', 'release/Mumble.compat', '-arch', 'x86_64', self.binary, '-output', self.binary))
+		retval = p.wait()
+		if retval != 0:
+			raise Exception('build-overlay-installer failed')
 
 	def set_min_macosx_version(self, version):
 		'''
@@ -322,11 +334,13 @@ def package_server():
 	else:
 		ver = gitrev()
 
-	name = 'Murmur-Static-%s' % ver
-	fn = name + '.xip'
+	name = 'Murmur-OSX-Static-%s' % ver
 
 	# Fix .ini files
-	os.system('cd scripts && sh mkini.sh')
+	p = Popen(('bash', 'mkini.sh'), cwd='scripts')
+	retval = p.wait()
+	if retval != 0:
+		raise Exception('build-overlay-installer failed')
 
 	destdir = os.path.join('release', name)
 	if os.path.exists(destdir):
@@ -347,10 +361,25 @@ def package_server():
 	codesign(os.path.join(destdir, 'murmurd'))
 
 	certname = 'Developer ID Installer: %s' % options.developer_id
-	p = Popen(('xip', '--keychain', options.keychain, '-s', certname, '--timestamp', destdir, os.path.join('release', fn)))
+	p = Popen(('xip', '--keychain', options.keychain, '-s', certname, '--timestamp', destdir, os.path.join('release', name+'.xip')))
 	retval = p.wait()
 	if retval != 0:
-		print 'Failed to build Murmur package'
+		print 'Failed to build Murmur XIP package'
+		sys.exit(1)
+
+	absrelease = os.path.join(os.getcwd(), 'release')
+
+	p = Popen(('tar', '-cjpf', name+'.tar.bz2', name), cwd=absrelease)
+	retval = p.wait()
+	if retval != 0:
+		print 'Failed to build Murmur tar.bz2 package'
+		sys.exit(1)
+
+	p = Popen(('gpg', '--detach-sign', '--armor', '-u', options.developer_id, '-o', name+'.tar.bz2.sig', name+'.tar.bz2'), cwd=absrelease)
+	retval = p.wait()
+	if retval != 0:
+		print 'Failed to sign Murmur tar.bz2 package'
+		sys.exit(1)
 
 if __name__ == '__main__':
 	parser = OptionParser()
@@ -358,7 +387,7 @@ if __name__ == '__main__':
 	parser.add_option('', '--universal', dest='universal', help='Build an universal snapshot.', action='store_true', default=False)
 	parser.add_option('', '--only-appbundle', dest='only_appbundle', help='Only prepare the appbundle. Do not package.', action='store_true', default=False)
 	parser.add_option('', '--only-overlay', dest='only_overlay', help='Only create the overlay installer.', action='store_true', default=False)
-	parser.add_option('', '--developer-id', dest='developer_id', help='Identity (Developer ID) to use for code signing. (If not set, no code signing will occur)')
+	parser.add_option('', '--developer-id', dest='developer_id', help='Identity (Developer ID) to use for code signing. The name is also used for GPG signing. (If not set, no code signing will occur)')
 	parser.add_option('', '--keychain', dest='keychain', help='The keychain to use when invoking code signing utilities. (Defaults to login.keychain', default='login.keychain')
 	parser.add_option('', '--server', dest='server', help='Build a Murmur package.', action='store_true', default=False)
 

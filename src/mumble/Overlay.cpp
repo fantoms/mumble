@@ -1,37 +1,13 @@
-/* Copyright (C) 2005-2011, Thorvald Natvig <thorvald@natvig.com>
-
-   All rights reserved.
-
-   Redistribution and use in source and binary forms, with or without
-   modification, are permitted provided that the following conditions
-   are met:
-
-   - Redistributions of source code must retain the above copyright notice,
-     this list of conditions and the following disclaimer.
-   - Redistributions in binary form must reproduce the above copyright notice,
-     this list of conditions and the following disclaimer in the documentation
-     and/or other materials provided with the distribution.
-   - Neither the name of the Mumble Developers nor the names of its
-     contributors may be used to endorse or promote products derived from this
-     software without specific prior written permission.
-
-   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-   A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR
-   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+// Copyright 2005-2017 The Mumble Developers. All rights reserved.
+// Use of this source code is governed by a BSD-style license
+// that can be found in the LICENSE file at the root of the
+// Mumble source tree or at <https://www.mumble.info/LICENSE>.
 
 #include "mumble_pch.hpp"
 
 #include "Overlay.h"
 
+#include "OverlayClient.h"
 #include "Channel.h"
 #include "ClientUser.h"
 #include "Database.h"
@@ -40,6 +16,7 @@
 #include "MainWindow.h"
 #include "Message.h"
 #include "OverlayText.h"
+#include "RichTextEditor.h"
 #include "ServerHandler.h"
 #include "User.h"
 #include "WebFetch.h"
@@ -90,7 +67,17 @@ Overlay::Overlay() : QObject() {
 #ifdef Q_OS_WIN
 	pipepath = QLatin1String("MumbleOverlayPipe");
 #else
-	pipepath = QDir::home().absoluteFilePath(QLatin1String(".MumbleOverlayPipe"));
+	{
+		QString xdgRuntimePath = QProcessEnvironment::systemEnvironment().value(QLatin1String("XDG_RUNTIME_DIR"));
+		QDir xdgRuntimeDir = QDir(xdgRuntimePath);
+
+		if (! xdgRuntimePath.isNull() && xdgRuntimeDir.exists()) {
+			pipepath = xdgRuntimeDir.absoluteFilePath(QLatin1String("MumbleOverlayPipe"));
+		} else {
+			pipepath = QDir::home().absoluteFilePath(QLatin1String(".MumbleOverlayPipe"));
+		}
+	}
+
 	{
 		QFile f(pipepath);
 		if (f.exists()) {
@@ -101,7 +88,7 @@ Overlay::Overlay() : QObject() {
 #endif
 
 	if (! qlsServer->listen(pipepath)) {
-		QMessageBox::warning(NULL, QLatin1String("Mumble"), tr("Failed to create communication with overlay at %2: %1. No overlay will be available.").arg(qlsServer->errorString(),pipepath), QMessageBox::Ok, QMessageBox::NoButton);
+		QMessageBox::warning(NULL, QLatin1String("Mumble"), tr("Failed to create communication with overlay at %2: %1. No overlay will be available.").arg(Qt::escape(qlsServer->errorString()), Qt::escape(pipepath)), QMessageBox::Ok, QMessageBox::NoButton);
 	} else {
 		qWarning() << "Overlay: Listening on" << qlsServer->fullServerName();
 		connect(qlsServer, SIGNAL(newConnection()), this, SLOT(newConnection()));
@@ -116,11 +103,18 @@ Overlay::~Overlay() {
 
 	// Need to be deleted first, since destructor references lingering QLocalSockets
 	foreach(OverlayClient *oc, qlClients)
+	{
+		// As we're the one closing the connection, we do not need to be
+		// notified of disconnects. This is important because on disconnect we
+		// also remove (and 'delete') the overlay client.
+		disconnect(oc->qlsSocket, SIGNAL(disconnected()), this, SLOT(disconnected()));
+		disconnect(oc->qlsSocket, SIGNAL(error(QLocalSocket::LocalSocketError)), this, SLOT(error(QLocalSocket::LocalSocketError)));
 		delete oc;
+	}
 }
 
 void Overlay::newConnection() {
-	while (1) {
+	while (true) {
 		QLocalSocket *qls = qlsServer->nextPendingConnection();
 		if (! qls)
 			break;
@@ -168,7 +162,7 @@ void Overlay::toggleShow() {
 				ProcessSerialNumber psn;
 				GetFrontProcess(&psn);
 				GetProcessPID(&psn, &pid);
-				if (pid != oc->uiPid)
+				if (static_cast<quint64>(pid) != oc->uiPid)
 					continue;
 #if 0
 				// Fullscreen only.
@@ -272,15 +266,21 @@ void Overlay::verifyTexture(ClientUser *cp, bool allowupdate) {
 			qb.open(QIODevice::ReadOnly);
 
 			QImageReader qir;
-			if (cp->qbaTexture.startsWith("<?xml"))
-				qir.setFormat("svg");
-			qir.setDevice(&qb);
-			if (! qir.canRead() || (qir.size().width() > 1024) || (qir.size().height() > 1024)) {
-				valid = false;
+			qir.setAutoDetectImageFormat(false);
+
+			QByteArray fmt;
+			if (RichTextImage::isValidImage(cp->qbaTexture, fmt)) {
+				qir.setFormat(fmt);
+				qir.setDevice(&qb);
+				if (! qir.canRead() || (qir.size().width() > 1024) || (qir.size().height() > 1024)) {
+					valid = false;
+				} else {
+					cp->qbaTextureFormat = qir.format();
+					QImage qi = qir.read();
+					valid = ! qi.isNull();
+				}
 			} else {
-				cp->qbaTextureFormat = qir.format();
-				QImage qi = qir.read();
-				valid = ! qi.isNull();
+				valid = false;
 			}
 		}
 		if (! valid) {
@@ -306,7 +306,7 @@ void Overlay::updateOverlay() {
 
 	foreach(OverlayClient *oc, qlClients) {
 		if (! oc->update()) {
-			qWarning() << "Overlay: Dead client detected";
+			qWarning() << "Overlay: Dead client detected. PID" << oc->uiPid << oc->qsExecutablePath;
 			qlClients.removeAll(oc);
 			oc->scheduleDelete();
 			break;
